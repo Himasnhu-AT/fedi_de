@@ -2,206 +2,177 @@
 
 This repo tracks all the approaches I took to understand the data in the `fedimint-observer.db` file.
 
-### Approach one:
+Expected Output:
 
-> :warning: For testing purposes only. Now changing it to running it with rust and build out server out of it.
-
-Loaded the data from file, loaded in docker image of sqlite, the ran `sqlite` queries to understand the data further. How it is stored, so on...
-
-### Approach two:
-
-- [x] Rust function to extract schema from the database, though it also available in the [fedimint-observer/schema/v0.sql](https://github.com/douglaz/fedimint-observer/blob/master/schema/v0.sql) table.
-
-<details>
-<summary> Function used (rust code) </summary>
-```rust
-fn print_schema(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT sql FROM sqlite_master WHERE type='table'")?;
-    let mut rows = stmt.query([])?;
-
-    println!("Database schema:");
-    while let Some(row) = rows.next()? {
-        let sql: String = row.get(0)?;
-        println!("{}", sql);
-    }
-
-    Ok(())
-}
 ```
-</details>
-
-<details>
-<summary>Output:</summary>
-```
-  Database schema:
-  CREATE TABLE federations (
-      federation_id BLOB PRIMARY KEY NOT NULL,
-      config BLOB NOT NULL
-  )
-  CREATE TABLE sessions (
-      federation_id BLOB NOT NULL REFERENCES federations(federation_id),
-      session_index INTEGER NOT NULL,
-      -- TODO: add transaction and item count
-      session BLOB NOT NULL,
-      PRIMARY KEY (federation_id, session_index)
-  )
-  CREATE TABLE transactions (
-      txid BLOB NOT NULL,
-      federation_id BLOB NOT NULL REFERENCES federations(federation_id),
-      session_index INTEGER NOT NULL,
-      item_index INTEGER NOT NULL,
-      data BLOB NOT NULL,
-      FOREIGN KEY (federation_id, session_index) REFERENCES sessions(federation_id, session_index),
-      PRIMARY KEY (federation_id, txid)
-  )
-  CREATE TABLE transaction_inputs (
-      federation_id BLOB NOT NULL REFERENCES federations(federation_id),
-      txid BLOB NOT NULL,
-      in_index INTEGER NOT NULL,
-      kind TEXT NOT NULL,
-      ln_contract_id BLOB,
-      amount_msat INTEGER,
-      PRIMARY KEY (federation_id, txid, in_index),
-      FOREIGN KEY (federation_id, txid) REFERENCES transactions(federation_id, txid), -- This might be a bit too heavy of a foreign key? Maybe use rowid instead?
-      FOREIGN KEY (federation_id, ln_contract_id) REFERENCES ln_contracts(federation_id, contract_id)
-  )
-  CREATE TABLE transaction_outputs (
-      federation_id BLOB NOT NULL REFERENCES federations(federation_id),
-      txid BLOB NOT NULL,
-      out_index INTEGER NOT NULL,
-      kind TEXT NOT NULL,
-      -- We keep the ln contract relation denormalized for now. If additional modules need extra data attached to
-      -- inputs/outputs we'll have to refactor that or introduce some constraints to keep the complexity manageable.
-      ln_contract_interaction_kind TEXT CHECK (ln_contract_interaction_kind IN ('fund', 'cancel', 'offer', NULL)),
-      ln_contract_id BLOB,
-      amount_msat INTEGER,
-      PRIMARY KEY (federation_id, txid, out_index),
-      FOREIGN KEY (federation_id, txid) REFERENCES transactions(federation_id, txid) -- This might be a bit too heavy of a foreign key? Maybe use rowid instead?
-      -- Can't apply the following FK constraint because contract doesn't exist yet when offers are created:
-      -- FOREIGN KEY (federation_id, ln_contract_id) REFERENCES ln_contracts(federation_id, contract_id)
-  )
-  CREATE TABLE ln_contracts (
-      federation_id BLOB NOT NULL REFERENCES federations(federation_id),
-      contract_id BLOB NOT NULL,
-      type TEXT NOT NULL CHECK (type IN ('incoming', 'outgoing')),
-      payment_hash BLOB NOT NULL,
-      PRIMARY KEY (federation_id, contract_id)
-  )
-  CREATE TABLE block_times (
-      block_height INTEGER PRIMARY KEY,
-      timestamp INTEGER NOT NULL
-  )
-  CREATE TABLE block_height_votes (
-      federation_id BLOB NOT NULL REFERENCES federations(federation_id),
-      session_index INTEGER NOT NULL,
-      item_index INTEGER NOT NULL,
-      proposer INTEGER NOT NULL,
-      height_vote INTEGER NOT NULL REFERENCES block_times(block_height),
-      PRIMARY KEY (federation_id, session_index, item_index),
-      FOREIGN KEY (federation_id, session_index) REFERENCES sessions(federation_id, session_index)
-  )
-```
-</details>
-
-- [x] Rust function to brute force the unique values in the database.
-
-<details>
-<summary> Function used (rust code) </summary>
-> Just a template, their were other function along with it.
-```rust
-fn print_transaction_output_kinds(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT DISTINCT kind FROM transaction_outputs")?;
-    let mut rows = stmt.query([])?;
-
-    println!("Distinct values of 'kind' in 'transaction_outputs' table:");
-    while let Some(row) = rows.next()? {
-        let kind: String = row.get(0)?;
-        println!("{}", kind);
-    }
-
-    Ok(())
-}
-```
-</details>
-
-<details>
-<summary>Output:</summary>
-```
-Distinct values of 'kind' in 'transaction_outputs' table:
-ln
-mint
-stability_pool
-wallet
-Distinct values of 'kind' in 'transaction_inputs' table:
-ln
-mint
-stability_pool
-wallet
-Distinct values of 'ln_contract_interaction_kind' in 'transaction_outputs' table:
-NULL
-offer
-fund
-cancel
-Distinct values of 'type' in 'ln_contracts' table:
-incoming
-outgoing
-```
-</details>
-
-- [x] understanding `pegged_in` and `pegged_out` values.
-> what pegged_in means?
-> > `Bitcoin` transferred in Fedimint network, and equivlent `mint` token created in the network.
-> what pegged_out means?
-> > Fedration's `mint token` burned and equivalent `Bitcoin` transferred out of the network.
-
-Going with this information, and database schema, we can assume:
-
-- transaction_outputs table:
-  - ln: Likely related to `Lightning Network` transactions, which might be part of the pegging process, especially as the fedimint utilizes it. [Reference](https://river.com/learn/terms/f/fedimint/#:~:text=Federations%20also%20make%20use%20of,bitcoin%20custody%20securely%20and%20honestly.)
-  - mint: This is the most likely candidate for `pegged-in` transactions, as it suggests the creation of new tokens.
-  - stability_pool: This might be related to mechanisms for stabilizing the token's value, but it's less likely to be directly tied to pegging.
-  - wallet: General wallet transactions, probably not directly related to pegging.
-- transaction_inputs table:
-  - ln: Similar to the outputs table, likely related to Lightning Network transactions.
-  - mint: This could be related to burning tokens, which might be part of the pegging-out process.
-  - stability_pool: Again, related to stability mechanisms.
-  - wallet: General wallet transactions.
-
-Based on Above assumptions, We ran code:
-<details>
-<summary> Function used (rust code) </summary>
-```rust
-fn get_federation_info(conn: &Connection) -> Result<FederationInfo> {
-    // Query to get the total pegged-in amount (mint tokens created)
-    let pegged_in: f64 = conn.query_row(
-        "SELECT IFNULL(SUM(amount_msat), 0) FROM transaction_outputs WHERE kind = 'mint'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    // Query to get the total pegged-out amount (mint tokens burned)
-    let pegged_out: f64 = conn.query_row(
-        "SELECT IFNULL(SUM(amount_msat), 0) FROM transaction_inputs WHERE kind = 'mint'",
-        [],
-        |row| row.get(0),
-    )?;
-
-    // Calculate the current balance in BTC (1BTC = 100_000_000_000 msat (mili-satoshi) as per https://bitcoindata.science/bitcoin-units-converter)
-    let conversion_rate = 100_000_000_000.0;
-
-    let current_balance = (pegged_in - pegged_out) / conversion_rate; // Convert from msat to BTC
-
-    Ok(FederationInfo {
-        pegged_in: pegged_in / conversion_rate,
-        pegged_out: pegged_out / conversion_rate,
-        current_balance,
-    })
-}
-```
-</details>
-
-<details>
-<summary>Output:</summary>
-```bash
 Federation info: FederationInfo { pegged_in: 16.93090330129, pegged_out: 16.32661183985, current_balance: 0.60429146144 }
 ```
+
+Flow i used to come to this conclusion:
+
+- Understand schema and values using [`fedimint-observer/schema/v0`](https://github.com/Himasnhu-AT/fedimint-observer/blob/master/schema/v0.sql), api calls using `fedimint-observer`
+
+- Ran SQL queries to extract relevant information from the database. Code of which are given in [src/main.rs](src/main.rs)
+
+- Used the extracted information to calculate the expected output.
+
+> As i had few doubts, went deep into codebase and found this:
+
+```rust
+process_transaction(
+        dbtx: &mut Transaction<'_, Any>,
+        federation_id: FederationId,
+        config: &ClientConfig,
+        session_index: u64,
+        item_index: u64,
+        transaction: fedimint_core::transaction::Transaction,
+    ) -> sqlx::Result<()> {
+        let txid = transaction.tx_hash();
+
+        query("INSERT INTO transactions VALUES ($1, $2, $3, $4, $5)")
+            .bind(txid.consensus_encode_to_vec())
+            .bind(federation_id.consensus_encode_to_vec())
+            .bind(session_index as i64)
+            .bind(item_index as i64)
+            .bind(transaction.consensus_encode_to_vec())
+            .execute(dbtx.as_mut())
+            .await?;
+
+        for (in_idx, input) in transaction.inputs.into_iter().enumerate() {
+            let kind = instance_to_kind(config, input.module_instance_id());
+            let (maybe_amount_msat, maybe_ln_contract_id) = match kind.as_str() {
+                "ln" => {
+                    let input = input
+                        .as_any()
+                        .downcast_ref::<LightningInput>()
+                        .expect("Not LN input")
+                        .maybe_v0_ref()
+                        .expect("Not v0");
+
+                    (Some(input.amount.msats), Some(input.contract_id))
+                }
+                "mint" => {
+                    let amount_msat = input
+                        .as_any()
+                        .downcast_ref::<MintInput>()
+                        .expect("Not Mint input")
+                        .maybe_v0_ref()
+                        .expect("Not v0")
+                        .amount
+                        .msats;
+
+                    (Some(amount_msat), None)
+                }
+                "wallet" => {
+                    let amount_msat = input
+                        .as_any()
+                        .downcast_ref::<WalletInput>()
+                        .expect("Not Wallet input")
+                        .maybe_v0_ref()
+                        .expect("Not v0")
+                        .0
+                        .tx_output()
+                        .value
+                        * 1000;
+                    (Some(amount_msat), None)
+                }
+                _ => (None, None),
+            };
+
+            query("INSERT INTO transaction_inputs VALUES ($1, $2, $3, $4, $5, $6)")
+                .bind(federation_id.consensus_encode_to_vec())
+                .bind(txid.consensus_encode_to_vec())
+                .bind(in_idx as i64)
+                .bind(kind.as_str())
+                .bind(maybe_ln_contract_id.map(|cid| cid.consensus_encode_to_vec()))
+                .bind(maybe_amount_msat.map(|amt| amt as i64))
+                .execute(dbtx.as_mut())
+                .await?;
+        }
+
+        for (out_idx, output) in transaction.outputs.into_iter().enumerate() {
+            let kind = instance_to_kind(config, output.module_instance_id());
+            let (maybe_amount_msat, maybe_ln_contract) = match kind.as_str() {
+                "ln" => {
+                    let ln_output = output
+                        .as_any()
+                        .downcast_ref::<LightningOutput>()
+                        .expect("Not LN input")
+                        .maybe_v0_ref()
+                        .expect("Not v0");
+                    let (maybe_amount_msat, ln_contract_interaction_kind, contract_id) =
+                        match ln_output {
+                            LightningOutputV0::Contract(contract) => {
+                                let contract_id = contract.contract.contract_id();
+                                let (contract_type, payment_hash) = match &contract.contract {
+                                    Contract::Incoming(c) => ("incoming", c.hash),
+                                    Contract::Outgoing(c) => ("outgoing", c.hash),
+                                };
+
+                                query("INSERT INTO ln_contracts VALUES ($1, $2, $3, $4)")
+                                    .bind(federation_id.consensus_encode_to_vec())
+                                    .bind(contract_id.consensus_encode_to_vec())
+                                    .bind(contract_type)
+                                    .bind(payment_hash.consensus_encode_to_vec())
+                                    .execute(dbtx.as_mut())
+                                    .await?;
+
+                                (Some(contract.amount.msats), "fund", contract_id)
+                            }
+                            LightningOutputV0::Offer(offer) => {
+                                // For incoming contracts payment has == cotnract id
+                                (Some(0), "offer", offer.hash.into())
+                            }
+                            LightningOutputV0::CancelOutgoing { contract, .. } => {
+                                (Some(0), "cancel", *contract)
+                            }
+                        };
+
+                    (
+                        maybe_amount_msat,
+                        Some((ln_contract_interaction_kind, contract_id)),
+                    )
+                }
+                "mint" => {
+                    let amount_msat = output
+                        .as_any()
+                        .downcast_ref::<MintOutput>()
+                        .expect("Not Mint input")
+                        .maybe_v0_ref()
+                        .expect("Not v0")
+                        .amount
+                        .msats;
+                    (Some(amount_msat), None)
+                }
+                "wallet" => {
+                    let amount_msat = output
+                        .as_any()
+                        .downcast_ref::<WalletOutput>()
+                        .expect("Not Wallet input")
+                        .maybe_v0_ref()
+                        .expect("Not v0")
+                        .amount()
+                        .to_sat()
+                        * 1000;
+                    (Some(amount_msat), None)
+                }
+                _ => (None, None),
+            };
+
+            query("INSERT INTO transaction_outputs VALUES ($1, $2, $3, $4, $5, $6, $7)")
+                .bind(federation_id.consensus_encode_to_vec())
+                .bind(txid.consensus_encode_to_vec())
+                .bind(out_idx as i64)
+                .bind(kind.as_str())
+                .bind(maybe_ln_contract.map(|cd| cd.0))
+                .bind(maybe_ln_contract.map(|cd| cd.1.consensus_encode_to_vec()))
+                .bind(maybe_amount_msat.map(|amt| amt as i64))
+                .execute(dbtx.as_mut())
+                .await?;
+        }
+
+        Ok(())
+    }
+```
+
+This helped me ensure correct results.

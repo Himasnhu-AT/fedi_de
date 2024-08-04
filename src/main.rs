@@ -100,6 +100,7 @@ fn brute_force_check_text_fields(conn: &Connection) -> Result<()> {
         ("transaction_inputs", "kind"),
         ("transaction_outputs", "ln_contract_interaction_kind"),
         ("ln_contracts", "type"),
+        ("transactions", "data"),
     ];
 
     for (table, field) in text_fields {
